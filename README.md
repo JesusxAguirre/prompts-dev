@@ -179,3 +179,213 @@ Proponé una arquitectura para [sistema/feature]:
 - Trade-offs de cada decisión
 - Flujos y diagramas con MERMAID
 ```
+
+
+## Database Design & Architecture - Production SQL Server
+
+```
+Diseñá schemas de base de datos production-ready siguiendo principios pragmáticos de integridad, performance y mantenibilidad. Prioriza claridad sobre "cleverness". El schema debe sobrevivir 10+ años.
+
+### Filosofía Core
+
+**Schema is Contract**
+- DB dura 10+ años, código cambia cada 6 meses
+- Prioriza data integrity sobre app-layer validation
+- FK constraints son la última línea de defensa
+- Si algo puede ser FK, DEBE ser FK
+
+**Auditabilidad por Defecto**
+- Temporal Tables (SYSTEM_VERSIONING = ON) para historial automático
+- Soft deletes con deleted_at (nunca DELETE físico)
+- created_by, created_at, updated_at obligatorios en transaccionales
+
+**Pragmatismo sobre Pureza**
+- Nombres que un PM entienda sin preguntar
+- Respeta legacy naming (breaking changes cuestan más que nombres "feos")
+- Junior DBA debe entender schema en 10 minutos sin docs
+
+---
+
+### Naming Conventions
+
+**Prefijos de tabla:**
+- ma_* → Master/catálogos (seed data, cambios lentos)
+- operational_* → Transaccionales (eventos, alta frecuencia de cambios)
+
+**Primary Keys:**
+- SIEMPRE id (no table_name_id)
+- Razón: Schema ya provee contexto (profiles.id es obvio)
+- Excepción: Legacy tables con naming inconsistente (respetar)
+
+**Foreign Keys:**
+- Usa nombre real: campaign_id (no generic_id)
+- FK autodocumentado apunta a qué tabla sin ver constraints
+
+**Timestamps:**
+- created_at → DATETIME2(7) UTC para API/logs
+- updated_at → DATETIME2(7) app-managed (puede ser local time)
+- updated_at_sys → GENERATED ALWAYS (system-managed, NO tocar)
+- valid_until → GENERATED ALWAYS (temporal versioning)
+
+**Soft Deletes:**
+- deleted_at DATETIME2(7) NULL (NO is_deleted BIT)
+- Razón: Auditable (cuándo se borró, no solo si/no)
+- Index obligatorio: WHERE deleted_at IS NULL (filtered)
+
+---
+
+### Foreign Keys: Data Integrity NO NEGOCIABLE
+
+**Anti-Pattern: Polymorphic Associations**
+- ❌ zone_type + zone_id (imposible crear FK real)
+- Problemas: orphan records, app validation bypasseable, queries complejas
+- ✅ Usar: 4 FKs explícitos + XOR constraint
+- Beneficio: DB garantiza integridad, queries simples, errores claros
+
+**Anti-Pattern: ENUM como FK innecesario**
+- ❌ FK a tabla de 5 filas fijas (JOIN extra en todas queries)
+- ✅ Usar: NVARCHAR + CHECK constraint
+- Excepción: Estados dinámicos o necesitas metadata (color, icon, sort_order)
+
+**XOR Constraint Pattern:**
+- Cuando exactamente UNO de N FKs debe ser NOT NULL
+- CHECK con CASE sums = 1
+- Combina con filtered indexes (WHERE column IS NOT NULL)
+
+---
+
+### Performance: Indexes Estratégicos
+
+**Filtered Indexes (nullable FKs):**
+- WHERE column IS NOT NULL
+- Razón: 75% reducción de espacio cuando solo 25% de filas usan FK
+- Obligatorio en XOR patterns
+
+**Composite Indexes (bucket queries):**
+- Cubre WHERE + GROUP BY + ORDER BY en una pasada
+- Index Seek > Index Scan
+- Ejemplo: (project_id, status, created_at) para dashboard queries
+
+**Covering Indexes (INCLUDE):**
+- Usar CON CUIDADO (infla tamaño)
+- Solo para queries críticas frecuentes
+- INCLUDE columnas SELECTeadas pero no filtradas
+
+**Index Naming:**
+- ix_table_columns (descriptivo)
+- ix_table_deleted para soft delete filtered indexes
+
+---
+
+### Temporal Tables: Auditabilidad Gratis
+
+**Setup obligatorio en transaccionales:**
+- updated_at_sys GENERATED ALWAYS AS ROW START
+- valid_until GENERATED ALWAYS AS ROW END (HIDDEN)
+- PERIOD FOR SYSTEM_TIME
+- WITH SYSTEM_VERSIONING = ON (HISTORY_TABLE = schema.ht_table)
+
+**Qué hace:**
+- Cada UPDATE mueve versión vieja a ht_* con valid_until = NOW()
+- Nueva versión queda con valid_until = 9999-12-31 (= activa)
+- Query histórico: FOR SYSTEM_TIME AS OF / ALL
+
+---
+
+### Documentation: Regla R015
+
+**sp_AddExtendedProperty OBLIGATORIO:**
+- Column descriptions en TODAS las columnas
+- Table description con propósito de negocio
+- Beneficio: SSMS muestra tooltips, DBA entiende sin docs externas
+- Formato: nivel de detalle que explique qué, por qué, cuándo usar
+
+---
+
+### Constraint Naming
+
+**Patterns consistentes:**
+- pk_table → Primary Key
+- fk_table_column → Foreign Key
+- ck_table_description → Check Constraint
+- df_table_column → Default Constraint
+- uq_table_column → Unique Constraint
+- ix_table_columns → Index
+
+**Razón:**
+- Error messages auto-explicativos
+- Troubleshooting rápido sin buscar en scripts
+
+---
+
+### Normalización vs Denormalización
+
+**Normalizar (default OLTP):**
+- Transaccionales con FK constraints
+- Relaciones 1:N reales
+- Data integrity crítica
+
+**Denormalizar (con cuidado):**
+- Agregados calculados lentos (computed columns PERSISTED)
+- Snapshots históricos (evitar JOINs a tablas cambiantes)
+- Reports/analytics (performance > consistency)
+
+**NUNCA duplicar:**
+- Columnas que existen en tabla relacionada vía FK
+- Usar JOINs o computed columns
+
+---
+
+### Testing Pre-Deploy
+
+**Checklist:**
+- FK Integrity: Insertar FK inválido (debe fallar)
+- CHECK Constraints: Valor fuera de ENUM (debe fallar)
+- XOR Constraints: 2 valores o 0 valores (debe fallar)
+- Temporal Tables: UPDATE y verificar historial en ht_*
+- Soft Delete: UPDATE deleted_at y queries con/sin filtro
+
+---
+
+### Naming: Inglés vs Español
+
+**Híbrido pragmático:**
+- Inglés para conceptos universales (PERMANENT, FIXED_TERM, Draft, Published)
+- Español donde negocio lo exige (legacy tables, términos legales sin equivalente)
+- Column descriptions en español si audiencia es 100% hispanohablante
+
+---
+
+### Golden Rules
+
+1. Schema is Contract - DB dura 10+ años
+2. Constraints > Validation - DB valida, app sugiere
+3. Explicit > Implicit - FK explícitos, no polymorphic
+4. Audit by Default - Temporal tables + soft delete
+5. Index for Reads, Constrain for Writes
+6. Document Everything - sp_AddExtendedProperty es tu amigo
+7. Pragmatism > Purity - Respetar legacy naming
+
+---
+
+### Output Esperado
+
+Generá:
+1. DDL Scripts (separados por tabla)
+2. Diagrama ER (Mermaid/DBML)
+3. Migration Plan (orden ejecución + rollback)
+4. Test Cases (queries validación constraints)
+5. Performance Analysis (índices y queries esperadas)
+6. Decisions Log (tabla con decisión, razón, trade-offs)
+
+---
+
+### Referencias
+
+- Bill Karwin - "SQL Antipatterns" (Ch 6: Polymorphic Associations)
+- C.J. Date - "Database Design and Relational Theory"
+- Joe Celko - "SQL for Smarties" (Ch 3: Naming)
+- Martin Fowler - "PEAA" (Identity Field, FK Mapping)
+- Microsoft Docs - Temporal Tables, Filtered Indexes
+```
+
