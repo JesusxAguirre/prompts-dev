@@ -182,64 +182,66 @@ Proponé una arquitectura para [sistema/feature]:
 
 
 ## Database Design & Architecture
-
-
-**Why**: Estos patterns evitan los errores más comunes de integridad y performance en producción.
-**Where**: pidb-ddl/scripts/ — cualquier archivo .sql de migración o DDL
-**Learned**:
---- TEMPORAL TABLE (Auditabilidad automática) ---
-```sql
-updated_at_sys DATETIME2(7) GENERATED ALWAYS AS ROW START NOT NULL,
-valid_until    DATETIME2(7) GENERATED ALWAYS AS ROW END HIDDEN NOT NULL,
-PERIOD FOR SYSTEM_TIME (updated_at_sys, valid_until)
--- Al final de CREATE TABLE:
-WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.ht_tabla_nombre));
-```
-Query histórico: SELECT * FROM tabla FOR SYSTEM_TIME AS OF '2025-01-01'
---- XOR CONSTRAINT (exactamente 1 de N FKs debe ser NOT NULL) ---
-```sql
-campaign_id     INT NULL,
-zone_id         INT NULL,
-project_id      INT NULL,
-client_id       INT NULL,
-CONSTRAINT ck_table_xor_zone CHECK (
-    (CASE WHEN campaign_id IS NOT NULL THEN 1 ELSE 0 END +
-     CASE WHEN zone_id     IS NOT NULL THEN 1 ELSE 0 END +
-     CASE WHEN project_id  IS NOT NULL THEN 1 ELSE 0 END +
-     CASE WHEN client_id   IS NOT NULL THEN 1 ELSE 0 END) = 1
-)
--- Filtered indexes para XOR (performance):
-CREATE INDEX ix_table_campaign ON table(campaign_id) WHERE campaign_id IS NOT NULL;
-CREATE INDEX ix_table_zone     ON table(zone_id)     WHERE zone_id IS NOT NULL;
-```
---- ENUM como CHECK (tabla de 5 filas fijas, NO FK) ---
-```sql
-status NVARCHAR(20) NOT NULL DEFAULT 'Draft'
-    CONSTRAINT ck_table_status CHECK (status IN ('Draft','Published','Archived','Deleted'))
-```
---- SOFT DELETE con filtered index ---
-```sql
-deleted_at DATETIME2(7) NULL CONSTRAINT df_table_deleted_at DEFAULT NULL,
-CREATE INDEX ix_table_deleted ON table(deleted_at) WHERE deleted_at IS NULL;
--- Query activos siempre: WHERE deleted_at IS NULL
-```
---- EXTENDED PROPERTIES (documentación en DB) ---
-```sql
-EXEC sp_AddExtendedProperty
-    @name = N'MS_Description',
-    @value = N'Descripción clara del propósito de esta columna',
-    @level0type = N'SCHEMA', @level0name = N'dbo',
-    @level1type = N'TABLE',  @level1name = N'nombre_tabla',
-    @level2type = N'COLUMN', @level2name = N'nombre_columna';
-```
---- COMPOSITE INDEX para dashboard queries ---
-```sql
-CREATE INDEX ix_table_project_status_created 
-    ON table(project_id, status, created_at)
-    INCLUDE (column_a, column_b);  -- INCLUDE solo para queries críticas frecuentes
-```
---- CHECKLIST PRE-DEPLOY ---
-- FK Integrity: insertar FK inválido → debe FALLAR
+Diseñá un schema de base de datos production-ready para [SISTEMA/FEATURE].
+### Contexto a proveer
+- Motor de base de datos: [SQL Server / PostgreSQL / MySQL / otro]
+- Tipo de carga: [OLTP / OLAP / mixto]
+- Tablas involucradas: [listar]
+- Relaciones conocidas: [describir]
+- Volumen estimado: [filas/día, tamaño esperado]
+---
+### Filosofía aplicada
+**Schema is Contract** — la DB dura 10+ años, el código cambia cada 6 meses.
+Priorizar data integrity sobre app-layer validation. Los constraints son la última línea de defensa.
+---
+### Output esperado
+1. **DDL Scripts** — separados por tabla, con constraints nombrados
+2. **Diagrama ER** — en Mermaid o DBML
+3. **Migration Plan** — orden de ejecución + rollback script
+4. **Test Cases** — queries que validan cada constraint
+5. **Decisions Log** — tabla con decisión, razón y trade-offs
+---
+### Reglas no negociables
+**Naming:**
+- PK siempre `id` (no `table_name_id`)
+- FK con nombre real: `campaign_id`, no `entity_id`
+- Constraints nombrados: `pk_`, `fk_`, `ck_`, `df_`, `uq_`, `ix_`
+**Integridad:**
+- Si algo puede ser FK, debe ser FK
+- Sin polymorphic associations (`type` + `entity_id`) — usar FKs explícitas + XOR constraint
+- ENUMs de catálogo fijo → CHECK constraint, no FK a tabla de 5 filas
+**Auditabilidad (tablas transaccionales):**
+- `created_at` — timestamp UTC, no editable
+- `updated_at` — app-managed
+- Soft delete: `deleted_at DATETIME NULL` (nunca `is_deleted BIT`, nunca DELETE físico)
+- Temporal versioning si el motor lo soporta (SYSTEM_VERSIONING en SQL Server, histórico manual en Postgres)
+**Performance:**
+- Filtered index en `deleted_at` (WHERE deleted_at IS NULL)
+- Filtered index en cada FK nullable de un XOR constraint
+- Composite index para queries de dashboard: (project_id, status, created_at)
+- INCLUDE solo en queries críticas frecuentes
+**Documentación inline:**
+- Comentario o extended property en cada columna
+- Propósito de negocio en descripción de tabla
+---
+### Anti-patterns a rechazar
+| ❌ Anti-pattern | ✅ Solución |
+|---|---|
+| Polymorphic: `type` + `entity_id` | FKs explícitas + XOR CHECK constraint |
+| `is_deleted BIT` | `deleted_at DATETIME NULL` |
+| DELETE físico en transaccionales | Soft delete siempre |
+| FK a tabla de 5 filas fijas | CHECK constraint con valores permitidos |
+| Columnas duplicadas de tabla relacionada | JOIN o computed column |
+| Constraints sin nombre | Nombrado explícito siempre |
+---
+### Checklist pre-deploy
+- [ ] FK Integrity: insertar FK inválido → debe FALLAR
+- [ ] CHECK Constraints: valor fuera de rango → debe FALLAR  
+- [ ] XOR Constraints: 0 valores o 2+ valores → debe FALLAR
+- [ ] Soft Delete: query sin `WHERE deleted_at IS NULL` devuelve borrados
+- [ ] Audit trail: UPDATE registra versión anterior
+- [ ] Indexes: plan de ejecución usa Index Seek (no Scan) en queries principales
+---
 - CHECK Constraints: valor fuera de ENUM → debe FALLAR
 - XOR Constraints: 2 valores o 0 valores → debe FALLAR
 - Temporal Tables: UPDATE → verificar historial en ht_*
